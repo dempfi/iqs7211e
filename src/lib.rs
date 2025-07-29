@@ -1,3 +1,5 @@
+#![no_std]
+
 mod config;
 mod control;
 mod defs;

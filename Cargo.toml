@@ -1,10 +1,17 @@
 [package]
-name = "iqs7211e"
-version = "0.1.0"
-edition = "2024"
+  authors     = ["Ike Kurghinyan <info@dempfi.com>"]
+  categories  = ["embedded", "no-std"]
+  description = "A Rust driver for the Azoteq IQS7211E touch sensor"
+  edition     = "2024"
+  keywords    = ["azoteq", "no_std", "iqs7211e"]
+  license     = "MIT OR Apache-2.0"
+  name        = "iqs7211e"
+  readme      = "README.md"
+  repository  = "https://github.com/dempfi/iqs7211e"
+  version     = "0.1.1"
 
 [dependencies]
-bitfield-struct = "0.11.0"
-defmt = "1.0.1"
-embedded-hal = "1.0.0"
-embedded-hal-async = "1.0.0"
+  bitfield-struct    = "0.11.0"
+  defmt              = "1.0.1"
+  embedded-hal       = "1.0.0"
+  embedded-hal-async = "1.0.0"
