@@ -64,10 +64,14 @@ impl RxTxMap {
   ///
   /// # Example
   ///
-  /// ```
-  /// let mapping = RxTxMapping::new(
-  ///     [0, 1, 2, 3, 4, 5], // rx pins
-  ///     [0, 1],             // tx pins
+  /// ```ignore
+  /// use iqs7211e::RxTxMap;
+  ///
+  /// let mapping = RxTxMap::new(
+  ///     &[0, 1, 2, 3, 4, 5], // rx pins
+  ///     &[0, 1],             // tx pins
+  ///     &[],                 // alp rx pins
+  ///     &[],                 // alp tx pins
   /// );
   ///
   /// let cycles = mapping.cycles();

@@ -1,3 +1,11 @@
+//! Async `no_std` driver for the Azoteq IQS7211E trackpad controller.
+//!
+//! The crate exposes a high level interface to configure and communicate with the
+//! controller over I²C. It relies solely on the traits from
+//! [`embedded-hal`](https://docs.rs/embedded-hal) and
+//! [`embedded-hal-async`](https://docs.rs/embedded-hal-async), allowing it to run on
+//! a wide variety of platforms.
+
 #![no_std]
 
 mod config;
@@ -29,6 +37,7 @@ pub enum Error<E> {
   BufferOverflow,
 }
 
+/// Driver for the IQS7211E controller.
 pub struct Iqs7211e<I, RDY> {
   i2c: I,
   rdy: RDY,
@@ -41,6 +50,8 @@ where
   I: I2c<SevenBitAddress, Error = E>,
   RDY: Wait,
 {
+  /// Create a new driver instance with the provided I²C peripheral, ready pin
+  /// and configuration.
   pub fn new(i2c: I, rdy: RDY, config: config::Config) -> Self {
     Self { i2c, rdy, state: DeviceState::Init, config }
   }
