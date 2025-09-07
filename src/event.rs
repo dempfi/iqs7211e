@@ -1,17 +1,95 @@
 use defmt::info;
-use embedded_hal::i2c::{I2c, SevenBitAddress};
 use embedded_hal_async::digital::Wait;
+use embedded_hal_async::i2c::{I2c, SevenBitAddress};
 
-use super::{DeviceState, Error, Iqs7211e, defs};
+use crate::{defs::*, Error, Iqs7211e};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
-pub struct Event {
-  pub gesture: Gesture,
+pub struct Report {
+  pub gesture: Option<Gesture>,
+  pub info: InfoFlags,
+  pub fingers: (Finger, Finger),
 }
 
-impl Event {
-  pub fn new(gesture: Gesture) -> Self {
-    Self { gesture }
+impl Report {
+  /// Build a new event snapshot with the supplied payload.
+  pub fn new(gesture: Option<Gesture>, info: InfoFlags, fingers: (Finger, Finger)) -> Self {
+    Self { gesture, info, fingers }
+  }
+
+  /// Get the primary finger (first finger) snapshot.
+  pub fn primary_finger(&self) -> Finger {
+    self.fingers.0
+  }
+
+  /// Get the secondary finger (second finger) snapshot.
+  pub fn secondary_finger(&self) -> Finger {
+    self.fingers.1
+  }
+
+  /// Get both fingers as a tuple (primary, secondary).
+  pub fn fingers(&self) -> (Finger, Finger) {
+    self.fingers
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use core::convert::TryFrom;
+
+  #[test]
+  fn finger_is_present_flag() {
+    assert!(Finger::new(10, 20, 30, 40).is_present());
+    assert!(!Finger::new(0xFFFF, 0xFFFF, 0, 0).is_present());
+  }
+
+  #[test]
+  fn finger_packbits_roundtrip() {
+    let original = Finger::new(0x0102, 0x0304, 0x0506, 0x0708);
+    let packed: [u8; 8] = original.into();
+    assert_eq!(packed, [0x02, 0x01, 0x04, 0x03, 0x06, 0x05, 0x08, 0x07]);
+
+    let decoded = Finger::try_from(packed).expect("finger decode");
+    assert_eq!(decoded, original);
+  }
+
+  #[test]
+  fn gesture_try_from_enforces_single_bit() {
+    assert_eq!(Gesture::try_from(0b0000_0000_0000_0001u16).ok(), Some(Gesture::SingleTap));
+    assert_eq!(Gesture::try_from(0b0000_0001_0000_0000u16).ok(), Some(Gesture::SwipeXPositive));
+    assert!(Gesture::try_from(0b0000_0000_0000_0011u16).is_err());
+  }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+#[packbits::pack(bytes = 8)]
+pub struct Finger {
+  pub x: u16,
+  pub y: u16,
+  pub strength: u16,
+  pub area: u16,
+}
+
+impl Finger {
+  pub const fn new(x: u16, y: u16, strength: u16, area: u16) -> Self {
+    Self { x, y, strength, area }
+  }
+
+  /// Returns a sentinel finger representing "no touch".
+  pub const fn absent() -> Self {
+    Self::new(0xFFFF, 0xFFFF, 0, 0)
+  }
+
+  /// Returns `true` if the finger represents an active touch.
+  pub const fn is_present(&self) -> bool {
+    self.x != 0xFFFF && self.y != 0xFFFF
+  }
+}
+
+impl Default for Finger {
+  fn default() -> Self {
+    Self::absent()
   }
 }
 
@@ -33,37 +111,33 @@ pub enum Gesture {
   SwipeHoldYNegative = 0b1000_0000_0000_0000,
 }
 
-impl Gesture {
-  pub(crate) const fn into_bits(self) -> u16 {
-    self as _
-  }
-
-  pub(crate) const fn from_bits(bits: u16) -> Self {
-    match bits {
-      0b0000_0000_0000_0001 => Self::SingleTap,
-      0b0000_0000_0000_0010 => Self::DoubleTap,
-      0b0000_0000_0000_0100 => Self::TripleTap,
-      0b0000_0000_0000_1000 => Self::PressHold,
-      0b0000_0000_0001_0000 => Self::Palm,
-      0b0000_0001_0000_0000 => Self::SwipeXPositive,
-      0b0000_0010_0000_0000 => Self::SwipeXNegative,
-      0b0000_0100_0000_0000 => Self::SwipeYPositive,
-      0b0000_1000_0000_0000 => Self::SwipeYNegative,
-      0b0001_0000_0000_0000 => Self::SwipeHoldXPositive,
-      0b0010_0000_0000_0000 => Self::SwipeHoldXNegative,
-      0b0100_0000_0000_0000 => Self::SwipeHoldYPositive,
-      0b1000_0000_0000_0000 => Self::SwipeHoldYNegative,
-      _ => unreachable!(),
-    }
+impl From<Gesture> for u16 {
+  fn from(g: Gesture) -> Self {
+    g as u16
   }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
-pub struct Touch {
-  pub x: u16,
-  pub y: u16,
-  pub strength: u16,
-  pub area: u16,
+impl TryFrom<u16> for Gesture {
+  type Error = ();
+
+  fn try_from(bits: u16) -> Result<Self, Self::Error> {
+    match bits {
+      0b0000_0000_0000_0001 => Ok(Self::SingleTap),
+      0b0000_0000_0000_0010 => Ok(Self::DoubleTap),
+      0b0000_0000_0000_0100 => Ok(Self::TripleTap),
+      0b0000_0000_0000_1000 => Ok(Self::PressHold),
+      0b0000_0000_0001_0000 => Ok(Self::Palm),
+      0b0000_0001_0000_0000 => Ok(Self::SwipeXPositive),
+      0b0000_0010_0000_0000 => Ok(Self::SwipeXNegative),
+      0b0000_0100_0000_0000 => Ok(Self::SwipeYPositive),
+      0b0000_1000_0000_0000 => Ok(Self::SwipeYNegative),
+      0b0001_0000_0000_0000 => Ok(Self::SwipeHoldXPositive),
+      0b0010_0000_0000_0000 => Ok(Self::SwipeHoldXNegative),
+      0b0100_0000_0000_0000 => Ok(Self::SwipeHoldYPositive),
+      0b1000_0000_0000_0000 => Ok(Self::SwipeHoldYNegative),
+      _ => Err(()),
+    }
+  }
 }
 
 impl<I, E, RDY> Iqs7211e<I, RDY>
@@ -71,62 +145,65 @@ where
   I: I2c<SevenBitAddress, Error = E>,
   RDY: Wait,
 {
-  pub async fn on_event(&mut self) -> Result<Event, Error<E>> {
+  pub async fn read_report(&mut self) -> Result<Report, Error<E>> {
     self.wait_for_comm_window().await?;
-    let gesture = self.get_gesture()?;
-    info!("IQS7211E: Gesture detected: {:?}", gesture);
 
-    let info_flags = self.info_flags()?;
+    let gesture = self.gesture().await?;
+    if let Some(g) = gesture {
+      info!("IQS7211E: Gesture detected: {:?}", g);
+    } else {
+      info!("IQS7211E: Gesture status clear");
+    }
+
+    let info_flags = self.info_flags().await?;
     info!(
       "CHRG: {:?}   FNGRS: {:?}   TP MVMNT: {:?}   ALP OUT: {:?}",
-      info_flags.charge_mode(),
-      info_flags.num_fingers(),
-      info_flags.tp_movement(),
-      info_flags.alp_output()
+      info_flags.charge_mode,
+      NumFingers::from_bits(info_flags.num_fingers),
+      info_flags.trackpad_movement,
+      info_flags.low_power_output
     );
 
-    let finger = self.finger1()?;
-    info!("Finger 1: x: {}, y: {}, strength: {}, area: {}", finger.x, finger.y, finger.strength, finger.area);
+    let finger1 = self.primary_finger().await?;
+    let finger2 = self.secondary_finger().await?;
+    info!("Finger 1: x: {}, y: {}, strength: {}, area: {}", finger1.x, finger1.y, finger1.strength, finger1.area);
+    info!("Finger 2: x: {}, y: {}, strength: {}, area: {}", finger2.x, finger2.y, finger2.strength, finger2.area);
 
-    match self.state {
-      DeviceState::Init => {
-        if self.init().await? {
-          info!("IQS7211E: Settings updated, device is initialized");
-          self.state = DeviceState::Run;
-        }
+    if !self.initialized {
+      if self.initialize().await? {
+        info!("IQS7211E: Settings updated, device is initialized");
+        self.initialized = true;
       }
-      DeviceState::CheckReset => {
-        if self.info_flags()?.show_reset() {
-          self.state = DeviceState::Init;
-        } else {
-          self.state = DeviceState::Run;
-        }
-      }
-      DeviceState::Run => {
-        self.state = DeviceState::CheckReset;
-      }
+    } else if info_flags.show_reset {
+      self.initialized = false;
     }
 
-    Ok(Event::new(gesture.unwrap_or(Gesture::Palm)))
+    Ok(Report::new(gesture, info_flags, (finger1, finger2)))
   }
 
-  pub(crate) fn get_gesture(&mut self) -> Result<Option<Gesture>, Error<E>> {
-    let buf = self.read_two_bytes(defs::IQS7211E_MM_GESTURES)?;
-    if buf == [0, 0] {
+  /// Read the current gesture, if any.
+  pub async fn gesture(&mut self) -> Result<Option<Gesture>, Error<E>> {
+    let raw = self.read_u16(Reg::Gestures).await?;
+    if raw == 0 {
       return Ok(None);
-    } else {
-      Ok(Some(Gesture::from_bits(u16::from_le_bytes(buf))))
     }
+    Ok(Gesture::try_from(raw).ok())
   }
 
-  pub(crate) fn finger1(&mut self) -> Result<Touch, Error<E>> {
-    let mut buf = [0u8; 8];
-    self.read_bytes(defs::IQS7211E_MM_FINGER_1_X, &mut buf)?;
-    let x = u16::from_le_bytes([buf[0], buf[1]]);
-    let y = u16::from_le_bytes([buf[2], buf[3]]);
-    let strength = u16::from_le_bytes([buf[4], buf[5]]);
-    let area = u16::from_le_bytes([buf[6], buf[7]]);
+  /// Read the primary finger snapshot (absolute position, strength, and area).
+  pub async fn primary_finger(&mut self) -> Result<Finger, Error<E>> {
+    self.read::<8, Finger>(Reg::Finger1X).await
+  }
 
-    Ok(Touch { x, y, strength, area })
+  /// Read the secondary finger snapshot (absolute position, strength, and area).
+  pub async fn secondary_finger(&mut self) -> Result<Finger, Error<E>> {
+    self.read::<8, Finger>(Reg::Finger2X).await
+  }
+
+  /// Convenience helper returning both finger snapshots in one call.
+  pub async fn fingers(&mut self) -> Result<(Finger, Finger), Error<E>> {
+    let primary = self.primary_finger().await?;
+    let secondary = self.secondary_finger().await?;
+    Ok((primary, secondary))
   }
 }

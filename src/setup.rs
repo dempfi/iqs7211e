@@ -1,16 +1,45 @@
-use defmt::info;
-use embedded_hal::i2c::{I2c, SevenBitAddress};
 use embedded_hal_async::digital::Wait;
+use embedded_hal_async::i2c::{I2c, SevenBitAddress};
 
-use crate::config;
+use crate::{config::AutoProxCycles, defs::*, Error, Iqs7211e};
 
-use super::{Error, Iqs7211e, control, defs};
+const MAX_TRACKPAD_CHANNELS: usize = 42;
 
-#[derive(PartialEq, Eq, defmt::Format)]
-pub enum SetupStep {
-  Step1,
-  Step2,
-  Step3,
+/// Snapshot of the live measurements that are typically reviewed while tuning
+/// a new hardware design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub struct SetupSnapshot {
+  /// Raw [`InfoFlags`] block reported by the device.
+  pub info_flags: InfoFlags,
+  /// Flattened view into the trackpad delta counters (0xE200). Use
+  /// `rx_count * tx_count` to determine how many entries are populated.
+  pub trackpad_deltas: [u16; MAX_TRACKPAD_CHANNELS],
+  /// Flattened view into the trackpad base targets (0xE100). Use
+  /// `rx_count * tx_count` to determine how many entries are populated.
+  pub trackpad_base_targets: [u16; MAX_TRACKPAD_CHANNELS],
+  /// Number of Rx electrodes captured in the snapshot.
+  pub rx_count: usize,
+  /// Number of Tx electrodes captured in the snapshot.
+  pub tx_count: usize,
+  /// Latest reported ALP channel long-term average.
+  pub low_power_channel_lta: u16,
+  /// Latest reported ALP channel count.
+  pub low_power_channel_count: u16,
+  /// ALP A/B channel counts.
+  pub low_power_count_a: u16,
+  pub low_power_count_b: u16,
+  /// ALP A/B compensation values.
+  pub low_power_comp_a: u16,
+  pub low_power_comp_b: u16,
+}
+
+/// State machine helper that guides the operator through the manual setup
+/// described in the Azoteq reference documentation.
+pub struct SetupSession<'a, I, RDY> {
+  device: &'a mut Iqs7211e<I, RDY>,
+  original_interrupt_mode: InterruptMode,
+  original_lp1_auto_prox_cycles: AutoProxCycles,
+  manual_control_enabled: bool,
 }
 
 impl<I, E, RDY> Iqs7211e<I, RDY>
@@ -18,94 +47,124 @@ where
   I: I2c<SevenBitAddress, Error = E>,
   RDY: Wait,
 {
-  /// Step1 — Determine AtiDivMul
-  /// Step2 — ALP ATI Setup
-  pub async fn setup(&mut self, step: SetupStep) -> Result<SetupStep, Error<E>> {
-    self.wait_for_comm_window().await?;
+  /// Begin an interactive setup sequence.
+  ///
+  /// The returned [`SetupSession`] stages the controller so that live
+  /// measurements can be collected and presented to the user. When the session
+  /// is finished, call [`SetupSession::finish`] to leave the device in a clean
+  /// state.
+  pub fn begin_setup(&mut self) -> SetupSession<'_, I, RDY> {
+    let original_interrupt_mode = self.config.interrupt_mode;
+    let original_lp1_auto_prox_cycles = self.config.hardware.low_power.lp1_auto_prox_cycles;
 
-    match step {
-      SetupStep::Step1 => {
-        self.config.interrupt_mode = control::InterruptMode::Stream;
-        self
-          .config
-          .alp_hw_settings
-          .set_lp1_auto_prox_cycles(config::AutoProxCycles::Disabled);
+    SetupSession { device: self, original_interrupt_mode, original_lp1_auto_prox_cycles, manual_control_enabled: false }
+  }
+}
 
-        if self.init().await? {
-          info!("INITIALIZED");
-        }
+impl<'a, I, E, RDY> SetupSession<'a, I, RDY>
+where
+  I: I2c<SevenBitAddress, Error = E>,
+  RDY: Wait,
+{
+  /// Perform the one-time initialisation required before tuning.
+  ///
+  /// This mirrors the "basic setup" portion of the Azoteq documentation by
+  /// switching the device to stream mode, disabling automatic ALP cycles, and
+  /// reloading the staged [`Config`](crate::Config). The controller stays in
+  /// manual-friendly stream mode until [`finish`](Self::finish) is invoked.
+  pub async fn initialize(&mut self) -> Result<(), Error<E>> {
+    self.device.config.interrupt_mode = InterruptMode::Stream;
+    self.device.config.hardware.low_power.lp1_auto_prox_cycles = AutoProxCycles::Disabled;
 
-        Ok(SetupStep::Step2)
-      }
+    // Run the regular device bring-up path with the staged parameters.
+    self.device.initialize().await?;
 
-      SetupStep::Step2 => {
-        self.config_settings(|x| x.set_manual_control(true))?;
-        self.sys_control(|x| x.set_charge_mode(control::ChargeMode::LowPower1))?;
-
-        Ok(SetupStep::Step3)
-      }
-
-      SetupStep::Step3 => {
-        let info_flags = self.info_flags()?;
-        let base = self.get_extended(0xE100)?;
-        let deltas = self.get_extended(0xE200)?;
-        let alp_channel_lta = u16::from_le_bytes(self.read_two_bytes(defs::IQS7211E_MM_ALP_CHANNEL_LTA)?);
-        let alp_channel_count = u16::from_le_bytes(self.read_two_bytes(defs::IQS7211E_MM_ALP_CHANNEL_COUNT)?);
-        let alp_count_a = u16::from_le_bytes(self.read_two_bytes(defs::IQS7211E_MM_ALP_CHANNEL_COUNT_A)?);
-        let alp_count_b = u16::from_le_bytes(self.read_two_bytes(defs::IQS7211E_MM_ALP_CHANNEL_COUNT_B)?);
-        let alp_comp_a = u16::from_le_bytes(self.read_two_bytes(defs::IQS7211E_MM_ALP_ATI_COMP_A)?);
-        let alp_comp_b = u16::from_le_bytes(self.read_two_bytes(defs::IQS7211E_MM_ALP_ATI_COMP_B)?);
-
-        info!(
-          "\x1B[9F\x1B[J CHRG: {:?}   FNGRS: {:?}   TP MVMNT: {:?}   ALP OUT: {:?}   ALP LTA: {:?}   ALP CNT: {:?}   ALP CNT A: {:?}    ALP CNT B: {:?}    ALP COMP A: {:?}    ALP COMP B: {:?}",
-          info_flags.charge_mode(),
-          info_flags.num_fingers(),
-          info_flags.tp_movement(),
-          info_flags.alp_output(),
-          alp_channel_lta,
-          alp_channel_count,
-          alp_count_a,
-          alp_count_b,
-          alp_comp_a,
-          alp_comp_b
-        );
-
-        info!("DELTAS:");
-        self.print_counts(&deltas);
-
-        info!("BASE TARGETS:");
-        self.print_counts(&base);
-        Ok(SetupStep::Step3)
-      }
-    }
+    // Restore the in-memory configuration so that callers can continue editing
+    // their preferred interrupt mode once the session has ended.
+    self.device.config.interrupt_mode = self.original_interrupt_mode;
+    self.device.config.hardware.low_power.lp1_auto_prox_cycles = self.original_lp1_auto_prox_cycles;
+    Ok(())
   }
 
-  fn print_counts(&self, counts: &[u16; 9]) {
-    for i in 0..3 {
-      info!("{:?} {:?} {:?}", counts[i * 3 + 0], counts[i * 3 + 1], counts[i * 3 + 2]);
-    }
+  /// Enable manual control and force the device into LP1 charge mode.
+  ///
+  /// This mirrors the GUI steps where the operator enables manual control under
+  /// "Control and Config" and selects the LP1 charge mode before capturing
+  /// counters.
+  pub async fn enter_manual_control(&mut self) -> Result<(), Error<E>> {
+    self.device.set_manual_control(true).await?;
+    self.device.set_charge_mode(ChargeMode::LowPower1).await?;
+    self.manual_control_enabled = true;
+    Ok(())
   }
 
-  fn get_extended(&mut self, from: u16) -> Result<[u16; 9], Error<E>> {
-    let mut ret = [0u16; 9];
+  /// Capture the live counters that are typically recorded while tuning.
+  pub async fn snapshot(&mut self) -> Result<SetupSnapshot, Error<E>> {
+    let rx_count = self.device.config.pin_mapping.rx_pins().len();
+    let tx_count = self.device.config.pin_mapping.tx_pins().len();
+    let populated = rx_count * tx_count;
+    debug_assert!(populated <= MAX_TRACKPAD_CHANNELS);
 
-    for i in 0..=8 {
-      let addr = from + i as u16;
-      let regs = addr.to_be_bytes();
-      let mut buf = [0u8; 2];
-      self
-        .i2c
-        .write_read(defs::IQS7211E_I2C_ADDR, &regs, &mut buf)
-        .map_err(Error::I2c)?;
+    let info_flags = self.device.info_flags().await?;
+    let base = self.read_measurement_block(0xE100, populated).await?;
+    let deltas = self.read_measurement_block(0xE200, populated).await?;
+    let low_power_channel_lta = self.device.read_u16(Reg::LowPowerChannelLta).await?;
+    let low_power_channel_count = self.device.read_u16(Reg::LowPowerChannelCount).await?;
+    let low_power_count_a = self.device.read_u16(Reg::LowPowerChannelCountA).await?;
+    let low_power_count_b = self.device.read_u16(Reg::LowPowerChannelCountB).await?;
+    let low_power_comp_a = self.device.read_u16(Reg::LowPowerAutoTuningCompA).await?;
+    let low_power_comp_b = self.device.read_u16(Reg::LowPowerAutoTuningCompB).await?;
 
-      ret[i] = u16::from_le_bytes(buf);
-    }
-
-    Ok(ret)
+    Ok(SetupSnapshot {
+      info_flags,
+      trackpad_deltas: deltas,
+      trackpad_base_targets: base,
+      rx_count,
+      tx_count,
+      low_power_channel_lta,
+      low_power_channel_count,
+      low_power_count_a,
+      low_power_count_b,
+      low_power_comp_a,
+      low_power_comp_b,
+    })
   }
 
-  pub async fn force_i2c(&mut self) -> Result<(), Error<E>> {
-    _ = self.rdy.wait_for_high().await;
-    self.write_bytes(0xFF, &[0x00])
+  /// Leave manual control and restore the interrupt configuration that was
+  /// active prior to the setup session.
+  pub async fn finish(mut self) -> Result<(), Error<E>> {
+    if self.manual_control_enabled {
+      self.device.set_manual_control(false).await?;
+      self.manual_control_enabled = false;
+    }
+
+    self.device.set_interrupt_mode(self.original_interrupt_mode).await?;
+    self.device.config.hardware.low_power.lp1_auto_prox_cycles = self.original_lp1_auto_prox_cycles;
+    Ok(())
+  }
+
+  async fn read_measurement_block(
+    &mut self,
+    from: u16,
+    populated: usize,
+  ) -> Result<[u16; MAX_TRACKPAD_CHANNELS], Error<E>> {
+    let mut out = [0u16; MAX_TRACKPAD_CHANNELS];
+
+    for (idx, entry) in out.iter_mut().take(populated).enumerate() {
+      let addr = from + idx as u16;
+      *entry = self.device.read_u16_ext(addr).await?;
+    }
+
+    Ok(out)
+  }
+}
+
+impl<'a, I, RDY> Drop for SetupSession<'a, I, RDY> {
+  fn drop(&mut self) {
+    // If the session terminates early without calling `finish`, the staged
+    // configuration should still be restored in-memory so that a subsequent
+    // call to `initialize` behaves as expected.
+    self.device.config.interrupt_mode = self.original_interrupt_mode;
+    self.device.config.hardware.low_power.lp1_auto_prox_cycles = self.original_lp1_auto_prox_cycles;
   }
 }

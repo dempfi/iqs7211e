@@ -1,143 +1,91 @@
-use super::{Error, Iqs7211e, defs};
-use bitfield_struct::bitfield;
-use embedded_hal::i2c::{I2c, SevenBitAddress};
 use embedded_hal_async::digital::Wait;
+use embedded_hal_async::i2c::{I2c, SevenBitAddress};
 
-#[bitfield(u16)]
-#[derive(PartialEq, Eq, defmt::Format)]
-pub(crate) struct InfoFlags {
-  #[bits(3)]
-  pub(crate) charge_mode: ChargeMode,
-  pub(crate) ati_error: bool,
-  pub(crate) re_ati_occurred: bool,
-  pub(crate) alp_ati_error: bool,
-  pub(crate) alp_re_ati_occurred: bool,
-  pub(crate) show_reset: bool,
-  #[bits(2)]
-  pub(crate) num_fingers: u8,
-  pub(crate) tp_movement: bool,
-  __: bool,
-  pub(crate) too_many_fingers: bool,
-  ___: bool,
-  pub(crate) alp_output: bool,
-  ____: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
-#[repr(u8)]
-pub(crate) enum ChargeMode {
-  Active = 0b000,
-  IdleTouch = 0b001,
-  Idle = 0b010,
-  LowPower1 = 0b011,
-  LowPower2 = 0b100,
-}
-
-impl ChargeMode {
-  pub(crate) const fn into_bits(self) -> u8 {
-    self as _
-  }
-
-  pub(crate) const fn from_bits(bits: u8) -> Self {
-    match bits {
-      0b000 => Self::Active,
-      0b001 => Self::IdleTouch,
-      0b010 => Self::Idle,
-      0b011 => Self::LowPower1,
-      0b100 => Self::LowPower2,
-      _ => unreachable!(),
-    }
-  }
-}
-
-#[bitfield(u16)]
-#[derive(PartialEq, Eq, defmt::Format)]
-pub(crate) struct SysControl {
-  #[bits(3)]
-  pub(crate) charge_mode: ChargeMode,
-  pub(crate) tp_reseed: bool,
-  pub(crate) alp_reseed: bool,
-  pub(crate) tp_re_ati: bool,
-  pub(crate) alp_re_ati: bool,
-  pub(crate) ack_reset: bool,
-  __: bool,
-  pub(crate) sw_reset: bool,
-  ___: bool,
-  pub(crate) suspend: bool,
-  #[bits(3)]
-  ____: u8,
-  pub(crate) tx_test: bool,
-}
-
-#[bitfield(u16)]
-#[derive(PartialEq, Eq, defmt::Format)]
-pub(crate) struct ConfigSettings {
-  #[bits(2)]
-  __: u8,
-  pub(crate) tp_re_ati_enable: bool,
-  pub(crate) alp_re_ati_enable: bool,
-  pub(crate) comms_request_enable: bool,
-  pub(crate) watchdog_timer: bool,
-  pub(crate) comms_end_cmd: bool,
-  pub(crate) manual_control: bool,
-  #[bits(1)]
-  pub(crate) interrupt_mode: InterruptMode,
-  pub(crate) gesture_event: bool,
-  pub(crate) tp_event: bool,
-  pub(crate) re_ati_event: bool,
-  ___: bool,
-  pub(crate) alp_event: bool,
-  pub(crate) tp_touch_event: bool,
-  ____: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
-pub enum InterruptMode {
-  /// I2C is presented each cycle (except auto-prox cycles)
-  Stream = 0b0,
-  /// I2C is only initiated when an enabled event occurs
-  Event = 0b1,
-}
-
-impl InterruptMode {
-  pub(crate) const fn into_bits(self) -> u8 {
-    self as _
-  }
-
-  pub(crate) const fn from_bits(bits: u8) -> Self {
-    match bits {
-      0b0 => Self::Stream,
-      0b1 => Self::Event,
-      _ => unreachable!(),
-    }
-  }
-}
+use crate::{defs::*, Error, Iqs7211e};
 
 impl<I, E, RDY> Iqs7211e<I, RDY>
 where
   I: I2c<SevenBitAddress, Error = E>,
   RDY: Wait,
 {
-  pub(crate) fn info_flags(&mut self) -> Result<InfoFlags, Error<E>> {
-    let buf = self.read_two_bytes(defs::IQS7211E_MM_INFO_FLAGS)?;
-    Ok(InfoFlags::from_bits(u16::from_le_bytes(buf)))
+  /// Fetch the product number and firmware revision as reported by the device.
+  pub async fn app_version(&mut self) -> Result<Version, Error<E>> {
+    self.read(Reg::AppVersion).await
   }
 
-  pub(crate) fn sys_control<F: FnOnce(&mut SysControl)>(&mut self, f: F) -> Result<(), Error<E>> {
-    let buf = self.read_two_bytes(defs::IQS7211E_MM_SYS_CONTROL)?;
-    let mut sys_control = SysControl::from_bits(u16::from_le_bytes(buf));
+  /// Read the real-time [`InfoFlags`] block.
+  pub async fn info_flags(&mut self) -> Result<InfoFlags, Error<E>> {
+    self.read(Reg::InfoFlags).await
+  }
+
+  /// Fetch the current [`SysControl`] structure from the device.
+  pub async fn read_sys_control(&mut self) -> Result<SysControl, Error<E>> {
+    self.read(Reg::SysControl).await
+  }
+
+  /// Write the provided [`SysControl`] structure to the device.
+  pub async fn write_sys_control(&mut self, sys: SysControl) -> Result<(), Error<E>> {
+    self.write(Reg::SysControl, sys).await
+  }
+
+  /// Fetch the current [`ConfigSettings`] structure from the device.
+  pub async fn read_config_settings(&mut self) -> Result<ConfigSettings, Error<E>> {
+    self.read(Reg::ConfigSettings).await
+  }
+
+  /// Write the provided [`ConfigSettings`] structure to the device.
+  pub async fn write_config_settings(&mut self, settings: ConfigSettings) -> Result<(), Error<E>> {
+    self.write(Reg::ConfigSettings, settings).await
+  }
+
+  /// Set the ACK_RESET bit which clears the SHOW_RESET flag in [`InfoFlags`].
+  pub async fn acknowledge_reset(&mut self) -> Result<(), Error<E>> {
+    self.modify_sys_control(|sys| sys.ack_reset = true).await
+  }
+
+  /// Trigger a fresh trackpad ATI routine.
+  pub async fn trigger_retune(&mut self) -> Result<(), Error<E>> {
+    self.modify_sys_control(|sys| sys.trackpad_retune = true).await
+  }
+
+  /// Trigger a fresh ALP ATI routine.
+  pub async fn trigger_retune_for_low_power(&mut self) -> Result<(), Error<E>> {
+    self.modify_sys_control(|sys| sys.low_power_retune = true).await
+  }
+
+  /// Issue a software reset (SW_RESET bit) to the controller.
+  pub async fn software_reset(&mut self) -> Result<(), Error<E>> {
+    self.modify_sys_control(|sys| sys.sw_reset = true).await
+  }
+
+  /// Change the charge/sensing mode used by the controller.
+  pub async fn set_charge_mode(&mut self, mode: ChargeMode) -> Result<(), Error<E>> {
+    self.modify_sys_control(|sys| sys.charge_mode = mode).await
+  }
+
+  /// Update the interrupt delivery mode (Event or Stream).
+  pub async fn set_interrupt_mode(&mut self, mode: InterruptMode) -> Result<(), Error<E>> {
+    self.modify_config_settings(|cfg| cfg.interrupt_mode = mode).await
+  }
+
+  /// Toggle the manual control bit.
+  pub async fn set_manual_control(&mut self, enable: bool) -> Result<(), Error<E>> {
+    self.modify_config_settings(|cfg| cfg.manual_control = enable).await
+  }
+
+  async fn modify_sys_control<F: FnOnce(&mut SysControl)>(&mut self, f: F) -> Result<(), Error<E>> {
+    let mut sys_control = self.read_sys_control().await?;
 
     f(&mut sys_control);
 
-    self.write_bytes(defs::IQS7211E_MM_SYS_CONTROL, &sys_control.into_bits().to_le_bytes())
+    self.write_sys_control(sys_control).await
   }
 
-  pub(crate) fn config_settings<F: FnOnce(&mut ConfigSettings)>(&mut self, f: F) -> Result<(), Error<E>> {
-    let buf = self.read_two_bytes(defs::IQS7211E_MM_CONFIG_SETTINGS)?;
-    let mut config_settings = ConfigSettings::from_bits(u16::from_le_bytes(buf));
+  async fn modify_config_settings<F: FnOnce(&mut ConfigSettings)>(&mut self, f: F) -> Result<(), Error<E>> {
+    let mut config_settings = self.read_config_settings().await?;
 
     f(&mut config_settings);
 
-    self.write_bytes(defs::IQS7211E_MM_CONFIG_SETTINGS, &config_settings.into_bits().to_le_bytes())
+    self.write_config_settings(config_settings).await
   }
 }
