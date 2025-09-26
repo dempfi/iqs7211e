@@ -17,21 +17,25 @@
 //!   across MCU families
 //! - Querying firmware details and live gesture/touch status without manual
 //!   register juggling
-//! - Optional high-level touchpad event façade (enable the `touchpad` Cargo feature)
 //!
 //! ```no_run
 //! use embedded_hal_async::{digital::Wait, i2c::{I2c, SevenBitAddress}};
-//! use iqs7211e::{Config, Iqs7211e, SensorPinMapping};
+//! use iqs7211e::{Config, Iqs7211e, Pinout, Pin};
 //!
 //! async fn example<I2C, RDY, E>(i2c: I2C, rdy: RDY) -> Result<(), iqs7211e::Error<E>>
 //! where
 //!   I2C: I2c<SevenBitAddress, Error = E>,
 //!   RDY: Wait,
 //! {
-//!   let mapping = SensorPinMapping::new(&[0, 1, 2, 3, 4], &[0, 1], &[0, 1], &[0]);
-//!   let config = Config::builder()
-//!     .sensor_pin_mapping(mapping)
-//!     .build();
+//!   let config = Config::default()
+//!     .with_pinout(
+//!       Pinout::new(
+//!         [Pin::RxTx0, Pin::RxTx1, Pin::RxTx2, Pin::RxTx3],
+//!         [Pin::Tx8, Pin::Tx9, Pin::Tx10],
+//!         [],
+//!         []
+//!       )
+//!     );
 //!
 //!   let mut controller = Iqs7211e::new(i2c, rdy, config);
 //!   _ = controller.initialize().await?;
@@ -40,25 +44,22 @@
 //! ```
 mod config;
 mod control;
-mod defs;
 mod event;
+mod reg;
+mod rw;
 mod setup;
-#[cfg(feature = "touchpad")]
-mod touchpad;
 
 use embedded_hal_async::digital::Wait;
 use embedded_hal_async::i2c::{I2c, SevenBitAddress};
 
 pub use config::*;
-use defs::*;
-pub use defs::{ChargeMode, ConfigSettings, InfoFlags, InterruptMode, NumFingers, SysControl, Version};
-pub use event::{Finger, Gesture, Report};
+pub use control::*;
+pub use event::*;
+use reg::*;
 pub use setup::*;
-#[cfg(feature = "touchpad")]
-pub use touchpad::*;
 
 /// Errors that can occur while interacting with the controller.
-#[derive(Debug, defmt::Format)]
+#[derive(Debug)]
 pub enum Error<E> {
   /// I²C bus transaction failed with the underlying driver error.
   I2c(E),
@@ -77,7 +78,6 @@ pub enum Error<E> {
 pub struct Iqs7211e<I, RDY> {
   i2c: I,
   rdy: RDY,
-  initialized: bool,
   config: config::Config,
 }
 
@@ -93,7 +93,7 @@ where
   /// [`Iqs7211e::initialize`] is called. This allows the caller to adjust fields
   /// after construction if desired.
   pub fn new(i2c: I, rdy: RDY, config: config::Config) -> Self {
-    Self { i2c, rdy, initialized: false, config }
+    Self { i2c, rdy, config }
   }
 
   /// Initialize the touchpad controller.
@@ -102,92 +102,56 @@ where
   /// pushes the staged configuration, and triggers the ATI calibration routine.
   /// Returns `true` if a configuration update occurred during initialization.
   pub async fn initialize(&mut self) -> Result<bool, Error<E>> {
+    // Device boots in Event Mode with Show Reset set. Since no events are
+    // happening yet, RDY stays HIGH. Force first communication window.
+    self.force_comms_request().await?;
+
     // Verify chip ID
-    self.wait_for_comm_window().await?;
     let prod_num = self.app_version().await?.number;
     if prod_num != PRODUCT_NUMBER {
       return Err(Error::InvalidChipId(prod_num as u8));
     }
 
-    // Reset if needed
-    self.wait_for_comm_window().await?;
-    if !self.info_flags().await?.show_reset {
+    // Check if reset occurred
+    if !self.info().await?.show_reset {
+      // No reset detected, request one
       self.software_reset().await?;
-      // @TODO: Wait for reset to complete
-      // embassy_time::Timer::after_millis(100).await;
+      // Wait for reset to complete - force comms since RDY won't pulse
+      loop {
+        self.wait_for_comm_window().await?;
+        if self.info().await?.show_reset {
+          break;
+        }
+      }
     }
+
+    // Switch to Stream Mode for initialization so RDY pulses every cycle
+    // This avoids having to force comms repeatedly
+    self.set_interrupt_mode(InterruptMode::Stream).await?;
 
     // Configure device
     self.wait_for_comm_window().await?;
-    self.write_config(self.config).await?;
+    let config = self.config;
+    self.write_config(&config).await?;
 
     self.wait_for_comm_window().await?;
-    self.acknowledge_reset().await?;
+    self.ack_reset().await?;
 
     // Trigger ATI and wait for completion
     self.wait_for_comm_window().await?;
-    self.trigger_retune().await?;
+    self.trigger_autotune().await?;
 
     loop {
       self.wait_for_comm_window().await?;
-      if self.info_flags().await?.re_auto_tuning_occurred {
+      if self.info().await?.re_auto_tuning_occurred {
         break;
       }
     }
 
-    // Set final interrupt mode
+    // Set final interrupt mode from config (may switch back to Event Mode)
     self.wait_for_comm_window().await?;
     self.set_interrupt_mode(self.config.interrupt_mode).await?;
 
     Ok(true)
-  }
-
-  async fn wait_for_comm_window(&mut self) -> Result<(), Error<E>> {
-    self.rdy.wait_for_falling_edge().await.map_err(|_| unreachable!())
-  }
-
-  // Typed helpers
-  async fn read<const N: usize, T: TryFrom<[u8; N]>>(&mut self, reg: Reg) -> Result<T, Error<E>> {
-    let mut b = [0u8; N];
-    self.read_bytes(reg, &mut b).await?;
-    T::try_from(b).map_err(|_| Error::BufferOverflow)
-  }
-
-  async fn read_u16(&mut self, reg: Reg) -> Result<u16, Error<E>> {
-    let buf: [u8; 2] = self.read(reg).await?;
-    Ok(u16::from_le_bytes(buf))
-  }
-
-  async fn write<const N: usize, T: TryInto<[u8; N]>>(&mut self, reg: Reg, v: T) -> Result<(), Error<E>> {
-    let b = v.try_into().map_err(|_| Error::BufferOverflow)?;
-    self.write_bytes(reg, &b).await
-  }
-
-  async fn read_bytes(&mut self, reg: Reg, buf: &mut [u8]) -> Result<(), Error<E>> {
-    let addr = [reg as u8];
-    self.i2c.write_read(I2C_ADDR, &addr, buf).await.map_err(Error::I2c)
-  }
-
-  async fn write_bytes(&mut self, reg: Reg, data: &[u8]) -> Result<(), Error<E>> {
-    let len = data.len();
-    if len > 31 {
-      return Err(Error::BufferOverflow);
-    }
-    let mut buf = [0u8; 32];
-    buf[0] = reg.into();
-    buf[1..=len].copy_from_slice(data);
-    self.i2c.write(I2C_ADDR, &buf[..=len]).await.map_err(Error::I2c)
-  }
-
-  // Extended (16-bit addressed) reads for diagnostic pages
-  async fn read_ext_bytes(&mut self, addr: u16, buf: &mut [u8]) -> Result<(), Error<E>> {
-    let regs = addr.to_be_bytes();
-    self.i2c.write_read(I2C_ADDR, &regs, buf).await.map_err(Error::I2c)
-  }
-
-  async fn read_u16_ext(&mut self, addr: u16) -> Result<u16, Error<E>> {
-    let mut buf = [0u8; 2];
-    self.read_ext_bytes(addr, &mut buf).await?;
-    Ok(u16::from_le_bytes(buf))
   }
 }

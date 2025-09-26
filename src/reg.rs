@@ -42,15 +42,15 @@ pub(crate) enum Reg {
   LowPowerChannelCountB = 0x1E,
 
   // ALP & TP ATI settings (0x1F..0x27)
-  LowPowerAutoTuningCompA = 0x1F,
-  LowPowerAutoTuningCompB = 0x20,
+  AlpAutoTuningCompA = 0x1F,
+  AlpAutoTuningCompB = 0x20,
   TpAutoTuningMultipliers = 0x21,
   TpRefDriftLimit = 0x22,
   TpAutoTuningTarget = 0x23,
   TpMinCountReAutoTuning = 0x24,
-  LowPowerAutoTuningMultipliers = 0x25,
-  LowPowerLtaDriftLimit = 0x26,
-  LowPowerAutoTuningTarget = 0x27,
+  AlpAutoTuningMultipliers = 0x25,
+  AlpLtaDriftLimit = 0x26,
+  AlpAutoTuningTarget = 0x27,
 
   // Report rates and timings (0x28..0x32)
   ActiveModeReportRate = 0x28,
@@ -69,8 +69,8 @@ pub(crate) enum Reg {
   SysControl = 0x33,
   ConfigSettings = 0x34,
   OtherSettings = 0x35,
-  LowPowerSetup = 0x36,
-  LowPowerTxEnable = 0x37,
+  AlpSetup = 0x36,
+  AlpTxEnable = 0x37,
 
   // Trackpad & ALP thresholds (0x38..0x3A)
   TouchSetClearMultipliers = 0x38,
@@ -83,9 +83,9 @@ pub(crate) enum Reg {
 
   // Channel setup (0x3D..0x40)
   TpConvFreq = 0x3D,
-  LowPowerConvFreq = 0x3E,
+  AlpConvFreq = 0x3E,
   TpHardware = 0x3F,
-  LowPowerHardware = 0x40,
+  AlpHardware = 0x40,
 
   // TP setup (0x41..0x49)
   TpRxSettings = 0x41,
@@ -165,162 +165,3 @@ impl From<Reg> for u8 {
   }
 }
 pub(crate) const PRODUCT_NUMBER: u16 = 0x0458;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
-#[packbits::pack(bytes = 10)]
-pub struct Version {
-  pub number: u16,
-  pub major: u8,
-  #[skip(8)]
-  pub minor: u8,
-  #[skip(8)]
-  pub commit: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
-#[repr(u8)]
-pub enum ChargeMode {
-  Active = 0b000,
-  IdleTouch = 0b001,
-  Idle = 0b010,
-  LowPower1 = 0b011,
-  LowPower2 = 0b100,
-}
-
-impl TryFrom<u8> for ChargeMode {
-  type Error = ();
-
-  fn try_from(bits: u8) -> Result<Self, Self::Error> {
-    match bits & 0b111 {
-      0b000 => Ok(Self::Active),
-      0b001 => Ok(Self::IdleTouch),
-      0b010 => Ok(Self::Idle),
-      0b011 => Ok(Self::LowPower1),
-      0b100 => Ok(Self::LowPower2),
-      _ => Err(()),
-    }
-  }
-}
-
-impl From<ChargeMode> for u8 {
-  fn from(v: ChargeMode) -> Self {
-    v as u8
-  }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
-pub enum NumFingers {
-  None,
-  One,
-  Two,
-  Reserved(u8),
-}
-
-impl NumFingers {
-  pub const fn from_bits(bits: u8) -> Self {
-    match bits & 0b11 {
-      0b00 => Self::None,
-      0b01 => Self::One,
-      0b10 => Self::Two,
-      other => Self::Reserved(other),
-    }
-  }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
-pub enum InterruptMode {
-  /// I2C is presented each cycle (except auto-prox cycles)
-  Stream = 0b0,
-  /// I2C is only initiated when an enabled event occurs
-  Event = 0b1,
-}
-
-impl TryFrom<u8> for InterruptMode {
-  type Error = ();
-
-  fn try_from(bits: u8) -> Result<Self, Self::Error> {
-    match bits & 0b1 {
-      0b0 => Ok(Self::Stream),
-      0b1 => Ok(Self::Event),
-      _ => Err(()),
-    }
-  }
-}
-
-impl From<InterruptMode> for u8 {
-  fn from(v: InterruptMode) -> Self {
-    v as u8
-  }
-}
-
-#[derive(PartialEq, Eq, defmt::Format, Debug, Clone, Copy)]
-#[packbits::pack(u16)]
-pub struct InfoFlags {
-  #[bits(3)]
-  pub charge_mode: ChargeMode,
-  pub auto_tuning_error: bool,
-  pub re_auto_tuning_occurred: bool,
-  pub low_power_auto_tuning_error: bool,
-  pub low_power_re_auto_tuning_occurred: bool,
-  pub show_reset: bool,
-  #[bits(2)]
-  pub num_fingers: u8,
-  pub trackpad_movement: bool,
-  #[skip(1)]
-  pub too_many_fingers: bool,
-  #[skip(1)]
-  pub low_power_output: bool,
-  // trailing reserved bit implicit
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn num_fingers_decodes() {
-    assert_eq!(NumFingers::from_bits(0b00), NumFingers::None);
-    assert_eq!(NumFingers::from_bits(0b01), NumFingers::One);
-    assert_eq!(NumFingers::from_bits(0b10), NumFingers::Two);
-    assert!(matches!(NumFingers::from_bits(0b11), NumFingers::Reserved(0b11)));
-  }
-}
-
-#[derive(PartialEq, Eq, defmt::Format, Debug, Clone, Copy)]
-#[packbits::pack(u16)]
-pub struct SysControl {
-  #[bits(3)]
-  pub charge_mode: ChargeMode,
-  pub trackpad_reseed: bool,
-  pub low_power_reseed: bool,
-  pub trackpad_retune: bool,
-  pub low_power_retune: bool,
-  pub ack_reset: bool,
-  #[skip(1)]
-  pub sw_reset: bool,
-  #[skip(1)]
-  pub suspend: bool,
-  #[skip(3)]
-  pub tx_test: bool,
-}
-
-#[derive(PartialEq, Eq, defmt::Format, Debug, Clone, Copy)]
-#[packbits::pack(u16)]
-pub struct ConfigSettings {
-  #[skip(2)]
-  pub trackpad_re_auto_tuning_enable: bool,
-  pub low_power_re_auto_tuning_enable: bool,
-  pub comms_request_enable: bool,
-  pub watchdog_timer: bool,
-  pub comms_end_cmd: bool,
-  pub manual_control: bool,
-  #[bits(1)]
-  pub interrupt_mode: InterruptMode,
-  pub gesture_event: bool,
-  pub trackpad_event: bool,
-  pub re_auto_tuning_event: bool,
-  #[skip(1)]
-  pub low_power_event: bool,
-  pub trackpad_touch_event: bool,
-  // trailing reserved bit implicit
-}

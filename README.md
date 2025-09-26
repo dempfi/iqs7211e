@@ -1,16 +1,15 @@
 # Azoteq IQS7211E driver
 
 `iqs7211e` is a `no_std` async driver for the [Azoteq IQS7211E]
-capacitive touch and gesture controller. It provides a high-level Rust
-API for configuring the sensor over I²C, including helper types for
-managing the complex Rx/Tx mapping and gesture settings that the chip
-exposes.
+capacitive touch and gesture controller. It provides a strongly-typed API
+for configuring the sensor over I²C, plus an awaited event API that yields
+gestures and one/two-finger snapshots.
 
 ## Status
 
 - ✅ Runs on `embedded-hal` and `embedded-hal-async` 1.0
 - ✅ End-to-end configuration routine that mirrors the reference design
-- ✅ Strongly typed configuration helpers (Rx/Tx maps, gesture toggles, ATI tuning)
+- ✅ Strongly typed configuration helpers (Rx/Tx pin layout, gesture toggles, ATI tuning)
 - ⚠️ Breaking API changes may still occur prior to `1.0`
 
 ## Getting started
@@ -23,22 +22,25 @@ iqs7211e = "0.1.2"
 ```
 
 Then initialise the device with an async I²C peripheral and a ready (RDY)
-GPIO implementing `embedded_hal_async::digital::Wait`:
+GPIO implementing `embedded_hal_async::digital::Wait`.
 
 ```rust
 use embedded_hal_async::digital::Wait;
 use embedded_hal_async::i2c::I2c;
-use iqs7211e::{Config, Iqs7211e, RxTxMap};
+use iqs7211e::{Config, Iqs7211e, Pinout, Pin};
 
 async fn bring_up<I2C, RDY, E>(i2c: I2C, rdy: RDY) -> Result<Iqs7211e<I2C, RDY>, iqs7211e::Error<E>>
 where
     I2C: I2c<embedded_hal_async::i2c::SevenBitAddress, Error = E>,
     RDY: Wait,
 {
-    let mapping = RxTxMap::new(&[0, 1, 2, 3, 4], &[0, 1], &[0, 1], &[0]);
-    let config = Config::builder()
-        .rxtx_map(mapping)
-        .build();
+  let pinout = Pinout::new(
+    [Pin::RxTx0, Pin::RxTx2, Pin::RxTx4],
+    [Pin::Tx8, Pin::Tx9],
+    [Pin::RxTx0],
+    [Pin::Tx8],
+  );
+  let config = Config::default().with_pinout(pinout);
 
     let mut controller = Iqs7211e::new(i2c, rdy, config);
     _ = controller.initialize().await?;
@@ -52,49 +54,8 @@ types and helpers.
 
 ## Listening for touch events
 
-The ergonomic touch facade lives behind the optional `touchpad` Cargo feature. In
-your `Cargo.toml`:
-
-```toml
-iqs7211e = { version = "0.1.2", features = ["touchpad"] }
-```
-
-Turn an `Iqs7211e` controller into an ergonomic touch listener with `Touchpad`. It
-keeps track of finger presence and only reports changes so you can focus on reacting
-to gestures and contact phases:
-
-```rust
-use embedded_hal_async::digital::Wait;
-use embedded_hal_async::i2c::{I2c, SevenBitAddress};
-use iqs7211e::{Config, TouchPhase, TouchSlot, Touchpad};
-
-async fn listen<I2C, RDY, E>(i2c: I2C, rdy: RDY) -> Result<(), iqs7211e::Error<E>>
-where
-    I2C: I2c<SevenBitAddress, Error = E>,
-    RDY: Wait,
-{
-    let config = Config::builder().build();
-    let controller = iqs7211e::Iqs7211e::new(i2c, rdy, config);
-    let mut touchpad = Touchpad::new(controller);
-
-    loop {
-        let report = touchpad.next_report().await?;
-
-        if let Some(gesture) = report.gesture() {
-            defmt::info!("gesture: {:?}", gesture);
-        }
-
-        for contact in report.contacts().iter() {
-            match (contact.slot, contact.phase) {
-                (TouchSlot::Primary, TouchPhase::Start) => defmt::info!("primary down at {}", contact.point.x),
-                (TouchSlot::Primary, TouchPhase::Move) => defmt::info!("primary moved to {}", contact.point.x),
-                (TouchSlot::Primary, TouchPhase::End) => defmt::info!("primary lifted"),
-                (TouchSlot::Secondary, phase) => defmt::info!("secondary update: {:?}", phase),
-            }
-        }
-    }
-}
-```
+Use `Iqs7211e::next_event()` to await gestures, single-touch, or multi-touch updates.
+See runnable examples in `examples/`.
 
 ## Feature overview
 
@@ -104,7 +65,6 @@ where
 - Manual setup session helper to read the counters documented in Azoteq's GUI workflow
 - Convenience helpers to query firmware info, gesture bitfields, and
   per-finger touch snapshots
-- Optional `touchpad` feature exposes the high-level facade that turns raw finger snapshots into ergonomic touch events
 - No allocation, fits `no_std` targets
 
 ## Manual setup workflow
@@ -122,10 +82,7 @@ where
     I2C: I2c<embedded_hal_async::i2c::SevenBitAddress, Error = E>,
     RDY: Wait,
 {
-    let config = Config::builder()
-        // Supply your Rx/Tx mapping, thresholds, etc. before the session starts.
-        // .rxtx_map(your_mapping)
-        .build();
+  let config = Config::default(); // set your pin layout, thresholds, etc. before the session starts
 
     let mut controller = Iqs7211e::new(i2c, rdy, config);
     let mut session = controller.begin_setup();
@@ -148,10 +105,10 @@ where
 }
 ```
 
-The [`SetupSnapshot`] structure exposes the live counters typically recorded
+The `SetupSnapshot` structure exposes the live counters typically recorded
 during bring-up:
 
-- `info_flags` mirrors the GUI indicator block (charge mode, ATI status, etc.)
+- `info` mirrors the GUI indicator block (charge mode, ATI status, etc.)
 - `trackpad_deltas` and `trackpad_base_targets` read back addresses `0xE200`
   and `0xE100` flattened to `rx_count * tx_count` entries
 - `rx_count` / `tx_count` help you reshape the flattened arrays into your
@@ -170,27 +127,27 @@ steps so you can script the process instead of relying on the GUI.
 - For the notes below let `channels = snapshot.rx_count * snapshot.tx_count`.
 
 - **Rx/Tx sanity checks** – While manual control is enabled, lightly touch the
-  corners and inspect `snapshot.info_flags.tp_movement` together with
+  corners and inspect `snapshot.info.tp_movement` together with
   `&snapshot.trackpad_deltas[..channels]`. If the active channels do not match the board layout,
-  revise `Config::rxtx_map` and rerun `initialize()`.
+  revise the pinout configuration and rerun `initialize()`.
 - **ATI iteration** – Use `snapshot.trackpad_base_targets` to determine the
-  base-target counts (doc section 4.2). Adjust `Config::tp_ati_target` and the
-  `tp_ati_div_mul` (`coarse_divider`, `coarse_multiplier`, `fine_divider`) until
-  the reported counts align with the lookup table. After updating the config
-  values, call `initialize()` again to write them back and trigger a fresh ATI.
-- **Compensation window** – The `alp_comp_*` fields reflect the compensation
+  base-target counts (doc section 4.2). Adjust the trackpad ATI settings via
+  `config.auto_tune.tune` (adjust `target`, `coarse_divider`, `coarse_multiplier`,
+  `fine_divider`) until the reported counts align with the lookup table. After updating
+  the config values, call `initialize()` again to write them back and trigger a fresh ATI.
+- **Compensation window** – The `alp_comp_*` fields in the snapshot reflect the compensation
   values. Keep them near the centre of the valid range (typically ~512). If the
-  snapshot shows values drifting to 0 or 1023, raise or lower
-  `tp_ati_comp_div` and repeat the ATI step.
+  snapshot shows values drifting to 0 or 1023, adjust
+  `config.auto_tune.tune.compensation_divider` and repeat the ATI step.
 - **Threshold tuning** – Record the per-channel deltas while pressing the
   corners (`&snapshot.trackpad_deltas[..channels]`) and compute the touch thresholds suggested in
   doc section 4.3. Apply the resulting multiplier to
-  `Config::touch_threshold` (set/clear) and reinitialise.
+  `config.channel_output.touch` (set/clear multipliers) and reinitialise.
 - **Mode timing** – Once the touch performance is acceptable, restore event
   mode via `SetupSession::finish()`, then update the report-rate and timeout
-  fields by writing directly to `controller.config` before the final
-  `initialize()`. The defaults in `defs::` match the reference design, but you
-  can tailor them to your power budget by following section 5 of the guide.
+  fields in `config.timing` before the final `initialize()`. The defaults match
+  the reference design, but you can tailor them to your power budget by following
+  section 5 of the guide.
 
 Repeat the capture → adjust → initialise loop until the recorded values match
 your targets. Because the configuration structure lives in memory, you can

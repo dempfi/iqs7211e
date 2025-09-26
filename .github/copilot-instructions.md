@@ -6,7 +6,7 @@ Purpose: no_std async Rust driver for the Azoteq IQS7211E capacitive touch/gestu
 
 - Crate entry: `src/lib.rs` defines `Iqs7211e<I2C, RDY>` and re-exports modules.
 - I²C addr: 0x56. RDY pin uses `embedded_hal_async::digital::Wait` to gate comm windows.
-- Async only; `no_std`; logs via `defmt`.
+- Async only; `no_std`.
 - Optional feature `touchpad` exposes a high-level event façade.
 
 ## Key modules and roles
@@ -20,7 +20,7 @@ Purpose: no_std async Rust driver for the Azoteq IQS7211E capacitive touch/gestu
 
 ## I/O and protocol patterns (important!)
 
-- Always wait for RDY: use `wait_for_comm_window()` before I²C access; it awaits `RDY.wait_for_falling_edge()`.
+- **RDY window management**: Call `wait_for_comm_window()` once before a **sequence** of register operations, not before each individual I²C transaction. Multiple reads/writes can occur within a single RDY window. The low-level `read_bytes`/`write_bytes` helpers do NOT wait for RDY—that's the caller's responsibility. See Arduino code for reference: RDY is checked once at the start of higher-level operations.
 - Addressing: regular regs are 8-bit; diagnostics use 16-bit "extended" reads (`read_u16_ext`, `read_ext_bytes`).
 - Write size limit: `write_bytes` allows max 31 data bytes (+1 reg) → otherwise `Error::BufferOverflow`.
 - Typed I/O: prefer `read<const N, T: TryFrom<[u8; N]>>()` and `write<const N, T: TryInto<[u8; N]>>()` with `packbits` types over manual buffers.
@@ -31,7 +31,7 @@ Purpose: no_std async Rust driver for the Azoteq IQS7211E capacitive touch/gestu
 2. If needed, `software_reset()` and handle reset indicator (`InfoFlags.show_reset`).
 3. Push staged config (`write_config(self.config)` inside `initialize()`), `acknowledge_reset()`.
 4. Trigger trackpad retune and poll until `InfoFlags.re_auto_tuning_occurred`.
-5. Set final interrupt mode from config. `initialize()` returns `Ok(true)` when settings were written.
+5. Set final interrupt mode from config.
 
 Manual tuning: `begin_setup() -> SetupSession` then `initialize().await`, `enter_manual_control().await`, `snapshot().await` (reads 0xE100/0xE200 and ALP counters), `finish().await` to restore modes.
 
@@ -44,7 +44,7 @@ Manual tuning: `begin_setup() -> SetupSession` then `initialize().await`, `enter
 ## Adding a new register/field (recipe)
 
 1. Add address to `Reg` in `defs.rs` (keep group/comments by datasheet section).
-2. Define/extend a `#[packbits::pack(...)]` type matching on-wire layout; derive `defmt::Format`.
+2. Define/extend a `#[packbits::pack(...)]` type matching on-wire layout.
 3. Add typed accessors in `control.rs` or on `Iqs7211e` using generic `read`/`write` helpers and the RDY gating.
 4. If staged config, thread through `config.rs` and ensure `initialize()` writes it at the correct step.
 

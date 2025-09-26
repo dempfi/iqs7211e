@@ -1,16 +1,16 @@
 use embedded_hal_async::digital::Wait;
 use embedded_hal_async::i2c::{I2c, SevenBitAddress};
 
-use crate::{config::AutoProxCycles, defs::*, Error, Iqs7211e};
+use crate::{AlpHardware, AutoProxCycles, ChargeMode, Error, Info, InterruptMode, Iqs7211e, Reg};
 
 const MAX_TRACKPAD_CHANNELS: usize = 42;
 
 /// Snapshot of the live measurements that are typically reviewed while tuning
 /// a new hardware design.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetupSnapshot {
-  /// Raw [`InfoFlags`] block reported by the device.
-  pub info_flags: InfoFlags,
+  /// Raw [`Info`] block reported by the device.
+  pub info: Info,
   /// Flattened view into the trackpad delta counters (0xE200). Use
   /// `rx_count * tx_count` to determine how many entries are populated.
   pub trackpad_deltas: [u16; MAX_TRACKPAD_CHANNELS],
@@ -22,15 +22,15 @@ pub struct SetupSnapshot {
   /// Number of Tx electrodes captured in the snapshot.
   pub tx_count: usize,
   /// Latest reported ALP channel long-term average.
-  pub low_power_channel_lta: u16,
+  pub alp_channel_lta: u16,
   /// Latest reported ALP channel count.
-  pub low_power_channel_count: u16,
+  pub alp_channel_count: u16,
   /// ALP A/B channel counts.
-  pub low_power_count_a: u16,
-  pub low_power_count_b: u16,
+  pub alp_count_a: u16,
+  pub alp_count_b: u16,
   /// ALP A/B compensation values.
-  pub low_power_comp_a: u16,
-  pub low_power_comp_b: u16,
+  pub alp_comp_a: u16,
+  pub alp_comp_b: u16,
 }
 
 /// State machine helper that guides the operator through the manual setup
@@ -39,6 +39,7 @@ pub struct SetupSession<'a, I, RDY> {
   device: &'a mut Iqs7211e<I, RDY>,
   original_interrupt_mode: InterruptMode,
   original_lp1_auto_prox_cycles: AutoProxCycles,
+  original_lp2_auto_prox_cycles: AutoProxCycles,
   manual_control_enabled: bool,
 }
 
@@ -54,10 +55,14 @@ where
   /// is finished, call [`SetupSession::finish`] to leave the device in a clean
   /// state.
   pub fn begin_setup(&mut self) -> SetupSession<'_, I, RDY> {
-    let original_interrupt_mode = self.config.interrupt_mode;
-    let original_lp1_auto_prox_cycles = self.config.hardware.low_power.lp1_auto_prox_cycles;
-
-    SetupSession { device: self, original_interrupt_mode, original_lp1_auto_prox_cycles, manual_control_enabled: false }
+    SetupSession {
+      device: self,
+      // Defaults are placeholders; real values are captured during initialize()
+      original_interrupt_mode: InterruptMode::Stream,
+      original_lp1_auto_prox_cycles: AutoProxCycles::Cycles16,
+      original_lp2_auto_prox_cycles: AutoProxCycles::Cycles32,
+      manual_control_enabled: false,
+    }
   }
 }
 
@@ -73,16 +78,23 @@ where
   /// reloading the staged [`Config`](crate::Config). The controller stays in
   /// manual-friendly stream mode until [`finish`](Self::finish) is invoked.
   pub async fn initialize(&mut self) -> Result<(), Error<E>> {
-    self.device.config.interrupt_mode = InterruptMode::Stream;
-    self.device.config.hardware.low_power.lp1_auto_prox_cycles = AutoProxCycles::Disabled;
-
     // Run the regular device bring-up path with the staged parameters.
     self.device.initialize().await?;
+    // Capture current on-device settings required for restoration
+    let settings = self.device.config_settings().await?;
+    self.original_interrupt_mode = settings.interrupt_mode;
 
-    // Restore the in-memory configuration so that callers can continue editing
-    // their preferred interrupt mode once the session has ended.
-    self.device.config.interrupt_mode = self.original_interrupt_mode;
-    self.device.config.hardware.low_power.lp1_auto_prox_cycles = self.original_lp1_auto_prox_cycles;
+    // Read ALP HW register to snapshot LP auto-prox cycles
+    let alp_hw: AlpHardware = self.device.read(Reg::AlpHardware).await?;
+    self.original_lp1_auto_prox_cycles = alp_hw.lp1_auto_prox_cycles;
+    self.original_lp2_auto_prox_cycles = alp_hw.lp2_auto_prox_cycles;
+
+    // Switch to stream mode and disable ALP auto-prox during tuning
+    self.device.set_interrupt_mode(InterruptMode::Stream).await?;
+    let mut new_alp = alp_hw;
+    new_alp.lp1_auto_prox_cycles = AutoProxCycles::Disabled;
+    new_alp.lp2_auto_prox_cycles = AutoProxCycles::Disabled;
+    self.device.write(Reg::AlpHardware, new_alp).await?;
     Ok(())
   }
 
@@ -100,33 +112,33 @@ where
 
   /// Capture the live counters that are typically recorded while tuning.
   pub async fn snapshot(&mut self) -> Result<SetupSnapshot, Error<E>> {
-    let rx_count = self.device.config.pin_mapping.rx_pins().len();
-    let tx_count = self.device.config.pin_mapping.tx_pins().len();
+    let rx_count = self.device.config.pinout.rx.len;
+    let tx_count = self.device.config.pinout.tx.len;
     let populated = rx_count * tx_count;
     debug_assert!(populated <= MAX_TRACKPAD_CHANNELS);
 
-    let info_flags = self.device.info_flags().await?;
+    let info_flags = self.device.info().await?;
     let base = self.read_measurement_block(0xE100, populated).await?;
     let deltas = self.read_measurement_block(0xE200, populated).await?;
-    let low_power_channel_lta = self.device.read_u16(Reg::LowPowerChannelLta).await?;
-    let low_power_channel_count = self.device.read_u16(Reg::LowPowerChannelCount).await?;
-    let low_power_count_a = self.device.read_u16(Reg::LowPowerChannelCountA).await?;
-    let low_power_count_b = self.device.read_u16(Reg::LowPowerChannelCountB).await?;
-    let low_power_comp_a = self.device.read_u16(Reg::LowPowerAutoTuningCompA).await?;
-    let low_power_comp_b = self.device.read_u16(Reg::LowPowerAutoTuningCompB).await?;
+    let alp_channel_lta = self.device.read_u16(Reg::LowPowerChannelLta).await?;
+    let alp_channel_count = self.device.read_u16(Reg::LowPowerChannelCount).await?;
+    let alp_count_a = self.device.read_u16(Reg::LowPowerChannelCountA).await?;
+    let alp_count_b = self.device.read_u16(Reg::LowPowerChannelCountB).await?;
+    let alp_comp_a = self.device.read_u16(Reg::AlpAutoTuningCompA).await?;
+    let alp_comp_b = self.device.read_u16(Reg::AlpAutoTuningCompB).await?;
 
     Ok(SetupSnapshot {
-      info_flags,
+      info: info_flags,
       trackpad_deltas: deltas,
       trackpad_base_targets: base,
       rx_count,
       tx_count,
-      low_power_channel_lta,
-      low_power_channel_count,
-      low_power_count_a,
-      low_power_count_b,
-      low_power_comp_a,
-      low_power_comp_b,
+      alp_channel_lta,
+      alp_channel_count,
+      alp_count_a,
+      alp_count_b,
+      alp_comp_a,
+      alp_comp_b,
     })
   }
 
@@ -137,9 +149,12 @@ where
       self.device.set_manual_control(false).await?;
       self.manual_control_enabled = false;
     }
-
+    // Restore interrupt mode and ALP auto-prox cycles
     self.device.set_interrupt_mode(self.original_interrupt_mode).await?;
-    self.device.config.hardware.low_power.lp1_auto_prox_cycles = self.original_lp1_auto_prox_cycles;
+    let mut alp: AlpHardware = self.device.read(Reg::AlpHardware).await?;
+    alp.lp1_auto_prox_cycles = self.original_lp1_auto_prox_cycles;
+    alp.lp2_auto_prox_cycles = self.original_lp2_auto_prox_cycles;
+    self.device.write(Reg::AlpHardware, alp).await?;
     Ok(())
   }
 
@@ -156,15 +171,5 @@ where
     }
 
     Ok(out)
-  }
-}
-
-impl<'a, I, RDY> Drop for SetupSession<'a, I, RDY> {
-  fn drop(&mut self) {
-    // If the session terminates early without calling `finish`, the staged
-    // configuration should still be restored in-memory so that a subsequent
-    // call to `initialize` behaves as expected.
-    self.device.config.interrupt_mode = self.original_interrupt_mode;
-    self.device.config.hardware.low_power.lp1_auto_prox_cycles = self.original_lp1_auto_prox_cycles;
   }
 }

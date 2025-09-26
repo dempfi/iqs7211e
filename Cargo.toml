@@ -1,38 +1,30 @@
 [package]
-authors      = ["Ike Kurghinyan <info@dempfi.com>"]
-categories   = ["embedded", "no-std"]
-description  = "Async I2C driver for the Azoteq IQS7211E capacitive touch and gesture controller"
-documentation = "https://docs.rs/iqs7211e"
-edition      = "2021"
-homepage     = "https://github.com/dempfi/iqs7211e"
-keywords     = ["azoteq", "iqs7211e", "touch", "sensor", "no_std"]
-license      = "MIT OR Apache-2.0"
-name         = "iqs7211e"
-readme       = "README.md"
-repository   = "https://github.com/dempfi/iqs7211e"
-rust-version = "1.75"
-version      = "0.1.2"
+  authors       = ["Ike Kurghinyan <info@dempfi.com>"]
+  categories    = ["embedded", "no-std"]
+  description   = "Async I2C driver for the Azoteq IQS7211E capacitive touch and gesture controller"
+  documentation = "https://docs.rs/iqs7211e"
+  edition       = "2021"
+  homepage      = "https://github.com/dempfi/iqs7211e"
+  keywords      = ["azoteq", "iqs7211e", "touch", "sensor", "no_std"]
+  license       = "MIT OR Apache-2.0"
+  name          = "iqs7211e"
+  readme        = "README.md"
+  repository    = "https://github.com/dempfi/iqs7211e"
+  rust-version  = "1.75"
+  version       = "0.1.2"
 
-include = [
-  "Cargo.toml",
-  "README.md",
-  "LICENSE*",
-  "src/**/*",
-  "docs/**/*",
-]
+  include = ["Cargo.toml", "README.md", "LICENSE*", "src/**/*", "docs/**/*"]
 
 [lib]
-doctest = false
+  doctest = false
 
 [features]
-default = []
-touchpad = []
+  default = []
 
 [badges]
-maintenance = { status = "experimental" }
+  maintenance = { status = "experimental" }
 
 [dependencies]
-defmt              = "1.0.1"
-embedded-hal       = "1.0.0"
-embedded-hal-async = "1.0.0"
-packbits           = "0.1.0"
+  embedded-hal       = "1.0.0"
+  embedded-hal-async = "1.0.0"
+  packbits           = { version = "0.1.1", path = "../packbits" }
